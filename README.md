@@ -4,6 +4,36 @@
 - `mlx` на macOS Apple Silicon (`mlx-whisper` + модель `mlx-community/whisper-large-v3-mlx`)
 - `hf` на остальных системах (`transformers` + `openai/whisper-large-v3`)
 
+## Quick Start: WhisperX + qwen3-30b-a3b (LM Studio)
+
+1. Установите `ffmpeg` (например, на macOS: `brew install ffmpeg`).
+2. Установите зависимости проекта и WhisperX:
+
+```bash
+uv sync --extra whisperx
+```
+
+3. Экспортируйте HF токен (нужен для diarization/pyannote):
+
+```bash
+export HF_TOKEN=hf_xxx
+```
+
+4. В LM Studio загрузите модель `qwen3-30b-a3b` и включите локальный сервер OpenAI API (`http://127.0.0.1:1234/v1`).
+5. Запустите транскрибацию со спикерами и сразу саммари:
+
+```bash
+uv run python transcribe_whisperx.py meeting.webm \
+  --hf-token "$HF_TOKEN" \
+  --summarize \
+  --summary-model qwen3-30b-a3b \
+  --summary-base-url http://127.0.0.1:1234/v1
+```
+
+Результат:
+- `meeting.speakers.txt` и `meeting.speakers.json` (диаризация)
+- `meeting.speakers.summary.md` (саммари)
+
 ## 1. Установка
 
 ```bash
