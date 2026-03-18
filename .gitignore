@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual envs
+.venv/
+
+# IDE / OS
+.idea/
+.DS_Store
+
+# Secrets
+hf_key
+.env
+.env.*
+
+# Local media and generated meeting artifacts
+*.webm
+*.mp4
+*.m4a
+*.wav
+*.speakers.txt
+*.speakers.json
+*.summary.md
+123.txt
+123.json
+123.webm
