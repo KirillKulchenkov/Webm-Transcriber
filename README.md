@@ -128,7 +128,55 @@ uv run python transcribe_webm.py meeting.webm \
 uv sync --extra whisperx
 ```
 
+Для video speaker fusion (OCR + анализ подсветки активного говорящего):
+
+```bash
+uv sync --extra whisperx --extra video
+```
+
+Также нужен установленный бинарник `tesseract` в PATH
+(например, на macOS: `brew install tesseract tesseract-lang`).
+
 На Windows это теперь тоже поддержано (через `torch 2.8.0+cu128`).
+
+### 6.0.1 Windows: что нужно для Video Speaker Fusion
+
+Для `--video-speaker-fusion` на Windows дополнительно проверьте:
+
+1. Установлены Python-зависимости:
+
+```powershell
+uv sync --extra whisperx --extra video
+```
+
+2. Установлен `ffmpeg` и доступен в `PATH`:
+
+```powershell
+ffmpeg -version
+```
+
+3. Установлен `Tesseract OCR` и доступен в `PATH`  
+   (обычно путь вида `C:\Program Files\Tesseract-OCR\`).
+
+Проверка:
+
+```powershell
+tesseract --version
+tesseract --list-langs
+```
+
+В списке языков должны быть `eng` и `rus` (если используете дефолт `--video-ocr-lang rus+eng`).
+
+Если `tesseract` не находится, после добавления в `PATH` перезапустите терминал/PowerShell.
+
+Быстрый запуск:
+
+```powershell
+$env:HF_TOKEN = "hf_xxx"
+uv run python transcribe_whisperx.py .\meeting.webm `
+  --video-speaker-fusion `
+  --video-profile auto
+```
 
 Запуск diarization:
 
@@ -157,6 +205,64 @@ uv run python transcribe_whisperx.py meeting.webm \
 Примечания по WhisperX:
 - для `pyannote/speaker-diarization-community-1` обычно нужен HF токен и принятие условий модели на Hugging Face;
 - на Apple Silicon WhisperX обычно работает на CPU (`--device cpu`), поэтому может быть медленнее MLX-транскрибации.
+
+### 6.1 Video Speaker Fusion
+
+Можно уточнить `SPEAKER_XX` через видеопоток (подсветка активного говорящего + OCR имен).
+
+Ключевые свойства:
+- анализируются только окна речи из таймингов WhisperX (не весь ролик);
+- после достижения порога уверенности speaker mapping lock'ается;
+- после lock по умолчанию обрабатывается только каждый 6-й сегмент для верификации;
+- порог уверенности конфигурируемый, по умолчанию `80%`.
+- есть профиль эвристик `--video-profile`:
+  - `auto` (по умолчанию) — пытается определить Телемост по видеопотоку;
+  - `generic` — универсальные эвристики;
+  - `yandex_telemost` — профиль, откалиброванный под Яндекс Телемост.
+
+Важно:
+- если OCR не находит надежных кандидатов имен, fusion помечается как `skipped`
+  и остаются исходные `SPEAKER_XX` (это безопасный fallback без ложных имен);
+- для максимальной точности рекомендуется передавать `--video-participants`
+  или `--video-participants-file`.
+
+Пример запуска:
+
+```bash
+uv run python transcribe_whisperx.py meeting.webm \
+  --hf-token "$HF_TOKEN" \
+  --video-speaker-fusion \
+  --video-profile auto \
+  --video-speaker-confidence-threshold 80 \
+  --video-lock-verify-every 6
+```
+
+Для Яндекс Телемоста можно зафиксировать профиль явно:
+
+```bash
+uv run python transcribe_whisperx.py meeting.webm \
+  --hf-token "$HF_TOKEN" \
+  --video-speaker-fusion \
+  --video-profile yandex_telemost
+```
+
+Если известен список участников, лучше передать его явно:
+
+```bash
+uv run python transcribe_whisperx.py meeting.webm \
+  --hf-token "$HF_TOKEN" \
+  --video-speaker-fusion \
+  --video-participants "Иван Петров,Анна Смирнова,Дмитрий Соколов"
+```
+
+Или из файла (по одному имени в строке):
+
+```bash
+uv run python transcribe_whisperx.py meeting.webm \
+  --hf-token "$HF_TOKEN" \
+  --video-speaker-fusion \
+  --video-participants-file ./participants.txt
+```
 
 ## 7. Саммари через LM Studio (OpenAI API)
 

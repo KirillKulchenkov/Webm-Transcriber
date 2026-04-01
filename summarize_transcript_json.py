@@ -61,7 +61,9 @@ def to_speaker_text(segments: list[dict[str, Any]]) -> str:
         text = str(seg.get("text", "")).strip()
         if not text:
             continue
-        speaker = str(seg.get("speaker", "SPEAKER_UNKNOWN"))
+        speaker_id = str(seg.get("speaker", "SPEAKER_UNKNOWN"))
+        speaker_name = str(seg.get("speaker_name", "")).strip()
+        speaker = f"{speaker_name} [{speaker_id}]" if speaker_name else speaker_id
         start = format_timestamp(seg.get("start"))
         end = format_timestamp(seg.get("end"))
         lines.append(f"[{start} - {end}] {speaker}: {text}")

@@ -22,8 +22,15 @@ from llm_summary import (
 TRANSCRIBE_TASK = "transcribe"
 DEFAULT_WHISPERX_MODEL = "large-v3"
 DEFAULT_DIARIZATION_MODEL = "pyannote/speaker-diarization-community-1"
+DEFAULT_VIDEO_CONFIDENCE_THRESHOLD_PERCENT = 80.0
+DEFAULT_VIDEO_FRAME_SAMPLE_FPS = 1.5
+DEFAULT_VIDEO_SEGMENT_PADDING_SEC = 0.35
+DEFAULT_VIDEO_MIN_SEGMENT_DURATION_SEC = 0.8
+DEFAULT_VIDEO_LOCK_VERIFY_EVERY = 6
+DEFAULT_VIDEO_PROFILE = "auto"
 
 DevicePreference = Literal["auto", "cuda", "cpu"]
+VideoProfile = Literal["auto", "generic", "yandex_telemost"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,11 +126,103 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Куда сохранить JSON с сегментами/спикерами (по умолчанию: рядом с входным файлом)",
     )
+    video_group = parser.add_argument_group(
+        "Video Speaker Fusion",
+        description=(
+            "Уточнение speaker->name через видео-подсветку активного говорящего. "
+            "Обрабатываются только окна речи по таймингам WhisperX."
+        ),
+    )
+    video_group.add_argument(
+        "--video-speaker-fusion",
+        action="store_true",
+        help="Включить fusion диаризации с видео-потоком.",
+    )
+    video_group.add_argument(
+        "--video-speaker-confidence-threshold",
+        type=float,
+        default=DEFAULT_VIDEO_CONFIDENCE_THRESHOLD_PERCENT,
+        help=(
+            "Порог lock уверенности в процентах (по умолчанию: "
+            f"{DEFAULT_VIDEO_CONFIDENCE_THRESHOLD_PERCENT})."
+        ),
+    )
+    video_group.add_argument(
+        "--video-frame-sample-fps",
+        type=float,
+        default=DEFAULT_VIDEO_FRAME_SAMPLE_FPS,
+        help=(
+            "Сколько кадров/сек брать при анализе окон речи "
+            f"(по умолчанию: {DEFAULT_VIDEO_FRAME_SAMPLE_FPS})."
+        ),
+    )
+    video_group.add_argument(
+        "--video-segment-padding",
+        type=float,
+        default=DEFAULT_VIDEO_SEGMENT_PADDING_SEC,
+        help=(
+            "Сколько секунд добавлять по краям сегмента перед анализом видео "
+            f"(по умолчанию: {DEFAULT_VIDEO_SEGMENT_PADDING_SEC})."
+        ),
+    )
+    video_group.add_argument(
+        "--video-min-segment-duration",
+        type=float,
+        default=DEFAULT_VIDEO_MIN_SEGMENT_DURATION_SEC,
+        help=(
+            "Минимальная длительность окна речи для анализа видео в секундах "
+            f"(по умолчанию: {DEFAULT_VIDEO_MIN_SEGMENT_DURATION_SEC})."
+        ),
+    )
+    video_group.add_argument(
+        "--video-lock-verify-every",
+        type=int,
+        default=DEFAULT_VIDEO_LOCK_VERIFY_EVERY,
+        help=(
+            "После lock проверять каждый N-й сегмент спикера "
+            f"(по умолчанию: {DEFAULT_VIDEO_LOCK_VERIFY_EVERY})."
+        ),
+    )
+    video_group.add_argument(
+        "--video-profile",
+        choices=("auto", "generic", "yandex_telemost"),
+        default=DEFAULT_VIDEO_PROFILE,
+        help=(
+            "Профиль эвристик для видеофьюжна: "
+            "auto (по умолчанию), generic, yandex_telemost."
+        ),
+    )
+    video_group.add_argument(
+        "--video-participants",
+        default=None,
+        help=(
+            "Список участников через запятую. "
+            "Если не задан, имена будут искаться OCR-ом автоматически."
+        ),
+    )
+    video_group.add_argument(
+        "--video-participants-file",
+        type=Path,
+        default=None,
+        help=(
+            "Файл со списком участников (по одному имени в строке). "
+            "Дополняет --video-participants."
+        ),
+    )
+    video_group.add_argument(
+        "--video-ocr-lang",
+        default="rus+eng",
+        help="Языки OCR для tesseract (по умолчанию: rus+eng).",
+    )
     add_summary_args(parser)
     return parser
 
 
-def ensure_prerequisites(input_path: Path) -> None:
+def ensure_prerequisites(
+    input_path: Path,
+    *,
+    use_video_speaker_fusion: bool = False,
+) -> None:
     if not input_path.exists():
         raise FileNotFoundError(f"Файл не найден: {input_path}")
     if shutil.which("ffmpeg") is None:
@@ -135,6 +234,17 @@ def ensure_prerequisites(input_path: Path) -> None:
             "Не найден модуль whisperx.\n"
             "Установите зависимости: `uv sync --extra whisperx`."
         )
+    if use_video_speaker_fusion:
+        if not has_module("cv2") or not has_module("pytesseract"):
+            raise RuntimeError(
+                "Для --video-speaker-fusion не хватает зависимостей. "
+                "Установите: `uv sync --extra whisperx --extra video`."
+            )
+        if shutil.which("tesseract") is None:
+            raise EnvironmentError(
+                "Для --video-speaker-fusion нужен бинарник tesseract в PATH. "
+                "Установите tesseract OCR и повторите запуск."
+            )
 
 
 def has_module(module_name: str) -> bool:
@@ -194,7 +304,9 @@ def format_timestamp(seconds: float | int | None) -> str:
 def to_speaker_text(segments: list[dict[str, Any]]) -> str:
     lines: list[str] = []
     for seg in segments:
-        speaker = str(seg.get("speaker", "SPEAKER_UNKNOWN"))
+        speaker_id = str(seg.get("speaker", "SPEAKER_UNKNOWN"))
+        speaker_name = str(seg.get("speaker_name", "")).strip()
+        speaker = f"{speaker_name} [{speaker_id}]" if speaker_name else speaker_id
         start = format_timestamp(seg.get("start"))
         end = format_timestamp(seg.get("end"))
         text = str(seg.get("text", "")).strip()
@@ -202,6 +314,98 @@ def to_speaker_text(segments: list[dict[str, Any]]) -> str:
             continue
         lines.append(f"[{start} - {end}] {speaker}: {text}")
     return "\n".join(lines).strip() + "\n"
+
+
+def parse_video_participants(
+    participants_csv: str | None,
+    participants_file: Path | None,
+) -> tuple[str, ...]:
+    raw_names: list[str] = []
+
+    if participants_csv:
+        raw_names.extend(participants_csv.split(","))
+
+    if participants_file:
+        if not participants_file.exists():
+            raise FileNotFoundError(
+                f"Файл со списком участников не найден: {participants_file}"
+            )
+        raw_names.extend(participants_file.read_text(encoding="utf-8").splitlines())
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for name in raw_names:
+        cleaned = " ".join(name.strip().split())
+        if not cleaned:
+            continue
+        lowered = cleaned.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        normalized.append(cleaned)
+
+    return tuple(normalized)
+
+
+def resolve_video_confidence_threshold(value_percent: float) -> float:
+    if value_percent <= 0 or value_percent > 100:
+        raise ValueError(
+            "--video-speaker-confidence-threshold должен быть в диапазоне (0, 100]."
+        )
+    return value_percent / 100.0
+
+
+def apply_video_speaker_fusion(
+    input_path: Path,
+    result: dict[str, Any],
+    *,
+    video_profile: VideoProfile,
+    confidence_threshold: float,
+    frame_sample_fps: float,
+    segment_padding_sec: float,
+    min_segment_duration_sec: float,
+    lock_verify_every: int,
+    participants: tuple[str, ...],
+    ocr_lang: str,
+) -> dict[str, Any]:
+    from video_speaker_fusion import (
+        VideoSpeakerFusionConfig,
+        run_video_speaker_fusion,
+    )
+
+    segments_raw = result.get("segments", [])
+    if not isinstance(segments_raw, list):
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "reason": "invalid_segments_type",
+        }
+
+    segments: list[dict[str, Any]] = [
+        segment for segment in segments_raw if isinstance(segment, dict)
+    ]
+    if not segments:
+        return {
+            "enabled": True,
+            "status": "skipped",
+            "reason": "empty_segments",
+        }
+
+    config = VideoSpeakerFusionConfig(
+        profile=video_profile,
+        confidence_threshold=confidence_threshold,
+        frame_sample_fps=frame_sample_fps,
+        segment_padding_sec=segment_padding_sec,
+        min_segment_duration_sec=min_segment_duration_sec,
+        lock_verify_every=max(1, lock_verify_every),
+        ocr_lang=ocr_lang,
+        participants=participants,
+    )
+    return run_video_speaker_fusion(
+        input_path=input_path,
+        segments=segments,
+        config=config,
+    )
 
 
 def sanitize_for_json(value: Any) -> Any:
@@ -377,7 +581,10 @@ def main() -> int:
     summary_path: Path | None = None
 
     try:
-        ensure_prerequisites(args.input)
+        ensure_prerequisites(
+            args.input,
+            use_video_speaker_fusion=args.video_speaker_fusion,
+        )
         hf_token = resolve_hf_token(args.hf_token)
         configure_hf_auth(hf_token)
         if not hf_token:
@@ -389,6 +596,14 @@ def main() -> int:
         device = resolve_device(args.device)
         compute_type = resolve_compute_type(args.compute_type, device)
         print(f"[info] hf_auth={'on' if hf_token else 'off'}")
+
+        video_confidence_threshold = resolve_video_confidence_threshold(
+            args.video_speaker_confidence_threshold
+        )
+        video_participants = parse_video_participants(
+            args.video_participants,
+            args.video_participants_file,
+        )
 
         result = run_whisperx_pipeline(
             input_path=args.input,
@@ -405,6 +620,27 @@ def main() -> int:
             max_speakers=args.max_speakers,
             skip_align=args.skip_align,
         )
+
+        if args.video_speaker_fusion:
+            print(
+                "[info] Запускаю video speaker fusion "
+                f"(profile={args.video_profile}, "
+                f"threshold={args.video_speaker_confidence_threshold:.1f}%)."
+            )
+            video_report = apply_video_speaker_fusion(
+                input_path=args.input,
+                result=result,
+                video_profile=args.video_profile,
+                confidence_threshold=video_confidence_threshold,
+                frame_sample_fps=args.video_frame_sample_fps,
+                segment_padding_sec=args.video_segment_padding,
+                min_segment_duration_sec=args.video_min_segment_duration,
+                lock_verify_every=args.video_lock_verify_every,
+                participants=video_participants,
+                ocr_lang=args.video_ocr_lang,
+            )
+            result.setdefault("metadata", {})["video_speaker_fusion"] = video_report
+
         txt_path, json_path = save_outputs(
             result=result,
             input_path=args.input,
@@ -440,6 +676,35 @@ def main() -> int:
     speakers = result.get("metadata", {}).get("speakers_detected", [])
     print("[ok] WhisperX diarization завершена.")
     print(f"[ok] Найденные спикеры: {', '.join(speakers) if speakers else 'нет данных'}")
+
+    video_meta = result.get("metadata", {}).get("video_speaker_fusion")
+    if isinstance(video_meta, dict):
+        status = str(video_meta.get("status", "unknown"))
+        requested_profile = str(video_meta.get("requested_profile", args.video_profile))
+        resolved_profile = str(video_meta.get("resolved_profile", requested_profile))
+        print(
+            f"[ok] Video fusion: {status} "
+            f"(profile={resolved_profile}, requested={requested_profile})"
+        )
+        if status == "ok":
+            fused_speakers = video_meta.get("speakers", {})
+            if isinstance(fused_speakers, dict):
+                resolved_lines: list[str] = []
+                for speaker_id, payload in fused_speakers.items():
+                    if not isinstance(payload, dict):
+                        continue
+                    speaker_name = payload.get("speaker_name")
+                    if not speaker_name:
+                        continue
+                    confidence = float(payload.get("confidence") or 0.0) * 100.0
+                    resolved_lines.append(
+                        f"{speaker_id} -> {speaker_name} ({confidence:.1f}%)"
+                    )
+                if resolved_lines:
+                    print("[ok] Video-resolved speakers:")
+                    for line in resolved_lines:
+                        print(f"      {line}")
+
     print(f"[ok] TXT:  {txt_path}")
     print(f"[ok] JSON: {json_path}")
     if summary_path:
