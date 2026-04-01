@@ -435,6 +435,8 @@ def main() -> int:
                 timeout=args.summary_timeout,
                 retries=args.summary_retries,
                 retry_delay=args.summary_retry_delay,
+                chunk_chars=args.summary_chunk_chars,
+                chunk_overlap_chars=args.summary_chunk_overlap_chars,
             )
             summary_path = save_summary(
                 summary_text,

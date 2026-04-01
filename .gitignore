@@ -15,6 +15,7 @@ hf_key
 .env.*
 
 # Local media and generated meeting artifacts
+examples/
 *.webm
 *.mp4
 *.m4a

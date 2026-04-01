@@ -166,9 +166,21 @@ uv run python transcribe_whisperx.py meeting.webm \
 По умолчанию используется:
 - `--summary-base-url http://127.0.0.1:1234/v1`
 - `--summary-model local-model`
+- `--summary-api-key` берется из `OPENAI_API_KEY` (если не задан, используется `lm-studio`)
 - `--summary-retries 3`
 - `--summary-retry-delay 2.0`
+- `--summary-chunk-chars 12000`
+- `--summary-chunk-overlap-chars 300`
 - встроенный промпт для структурированного саммари на русском
+
+Если используете не LM Studio, а внешний OpenAI-compatible endpoint, задайте API ключ:
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+```
+
+Если стенограмма не влезает в один запрос, саммари автоматически делится на чанки,
+каждый чанк суммаризируется отдельно, затем частичные саммари объединяются в итоговое.
 
 Пример с `transcribe_webm.py`:
 
@@ -176,7 +188,8 @@ uv run python transcribe_whisperx.py meeting.webm \
 uv run python transcribe_webm.py meeting.webm \
   --backend auto \
   --summarize \
-  --summary-model your-lmstudio-model
+  --summary-model your-lmstudio-model \
+  --summary-api-key "$OPENAI_API_KEY"
 ```
 
 Пример с `transcribe_whisperx.py`:
@@ -185,7 +198,8 @@ uv run python transcribe_webm.py meeting.webm \
 uv run python transcribe_whisperx.py meeting.webm \
   --device auto \
   --summarize \
-  --summary-model your-lmstudio-model
+  --summary-model your-lmstudio-model \
+  --summary-api-key "$OPENAI_API_KEY"
 ```
 
 Если нужно, можно передать кастомный промпт:
@@ -194,8 +208,31 @@ uv run python transcribe_whisperx.py meeting.webm \
 uv run python transcribe_webm.py meeting.webm \
   --summarize \
   --summary-model your-lmstudio-model \
+  --summary-timeout 1200 \
+  --summary-chunk-chars 10000 \
   --summary-prompt "Ваш уточненный промпт"
 ```
+
+Отдельный запуск саммари по уже готовому JSON транскрибации:
+
+```bash
+uv run python summarize_transcript_json.py meeting.json \
+  --summary-model qwen3-30b-a3b
+```
+
+Для JSON со спикерами (`meeting.speakers.json`) можно принудительно использовать
+формат со спикер-метками:
+
+```bash
+uv run python summarize_transcript_json.py meeting.speakers.json \
+  --speaker-format always \
+  --summary-model qwen3-30b-a3b
+```
+
+Параметр `--speaker-format`:
+- `auto` (по умолчанию): если в JSON есть speaker-сегменты, саммари строится по строкам вида `SPEAKER_XX: ...`, иначе по обычному тексту.
+- `always`: принудительно использовать speaker-формат; если speaker-сегментов нет, скрипт завершится с ошибкой.
+- `never`: всегда использовать plain text без speaker-меток.
 
 ## Примечание
 
