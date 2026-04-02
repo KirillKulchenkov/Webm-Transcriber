@@ -8,6 +8,7 @@ import os
 import platform
 import shutil
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Literal
@@ -29,6 +30,7 @@ DEFAULT_VIDEO_SEGMENT_PADDING_SEC = 0.35
 DEFAULT_VIDEO_MIN_SEGMENT_DURATION_SEC = 0.8
 DEFAULT_VIDEO_LOCK_VERIFY_EVERY = 6
 DEFAULT_VIDEO_PROFILE = "auto"
+DEFAULT_VIDEO_OCR_WORKERS = int(os.getenv("VIDEO_OCR_WORKERS", "1"))
 
 DevicePreference = Literal["auto", "cuda", "cpu"]
 VideoProfile = Literal["auto", "generic", "yandex_telemost"]
@@ -215,6 +217,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="rus+eng",
         help="Языки OCR для tesseract (по умолчанию: rus+eng).",
     )
+    video_group.add_argument(
+        "--video-ocr-workers",
+        type=int,
+        default=DEFAULT_VIDEO_OCR_WORKERS,
+        help=(
+            "Количество потоков OCR в video fusion "
+            f"(по умолчанию: {DEFAULT_VIDEO_OCR_WORKERS}). "
+            "Больше значение сильнее грузит CPU и обычно ускоряет обработку."
+        ),
+    )
     add_summary_args(parser)
     return parser
 
@@ -356,6 +368,12 @@ def resolve_video_confidence_threshold(value_percent: float) -> float:
     return value_percent / 100.0
 
 
+def resolve_video_ocr_workers(value: int) -> int:
+    if value < 1:
+        raise ValueError("--video-ocr-workers должен быть целым числом >= 1.")
+    return value
+
+
 def apply_video_speaker_fusion(
     input_path: Path,
     result: dict[str, Any],
@@ -368,6 +386,7 @@ def apply_video_speaker_fusion(
     lock_verify_every: int,
     participants: tuple[str, ...],
     ocr_lang: str,
+    ocr_workers: int,
 ) -> dict[str, Any]:
     from video_speaker_fusion import (
         VideoSpeakerFusionConfig,
@@ -400,6 +419,7 @@ def apply_video_speaker_fusion(
         min_segment_duration_sec=min_segment_duration_sec,
         lock_verify_every=max(1, lock_verify_every),
         ocr_lang=ocr_lang,
+        ocr_workers=max(1, ocr_workers),
         participants=participants,
     )
     return run_video_speaker_fusion(
@@ -601,6 +621,7 @@ def main() -> int:
         video_confidence_threshold = resolve_video_confidence_threshold(
             args.video_speaker_confidence_threshold
         )
+        video_ocr_workers = resolve_video_ocr_workers(args.video_ocr_workers)
         video_participants = parse_video_participants(
             args.video_participants,
             args.video_participants_file,
@@ -626,8 +647,10 @@ def main() -> int:
             print(
                 "[info] Запускаю video speaker fusion "
                 f"(profile={args.video_profile}, "
-                f"threshold={args.video_speaker_confidence_threshold:.1f}%)."
+                f"threshold={args.video_speaker_confidence_threshold:.1f}%, "
+                f"ocr_workers={video_ocr_workers})."
             )
+            fusion_started_at = time.perf_counter()
             video_report = apply_video_speaker_fusion(
                 input_path=args.input,
                 result=result,
@@ -639,7 +662,21 @@ def main() -> int:
                 lock_verify_every=args.video_lock_verify_every,
                 participants=video_participants,
                 ocr_lang=args.video_ocr_lang,
+                ocr_workers=video_ocr_workers,
             )
+            fusion_elapsed_sec = time.perf_counter() - fusion_started_at
+            stats = video_report.get("stats")
+            if isinstance(stats, dict):
+                frames_processed = stats.get("frames_processed")
+                analyzed_segments = stats.get("analyzed_segments")
+                print(
+                    "[info] Video fusion timing: "
+                    f"{fusion_elapsed_sec:.2f}s, "
+                    f"frames={frames_processed}, "
+                    f"segments={analyzed_segments}"
+                )
+            else:
+                print(f"[info] Video fusion timing: {fusion_elapsed_sec:.2f}s")
             result.setdefault("metadata", {})["video_speaker_fusion"] = video_report
 
         txt_path, json_path = save_outputs(

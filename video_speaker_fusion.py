@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import re
+from concurrent.futures import Executor, ThreadPoolExecutor
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -58,6 +59,7 @@ class VideoSpeakerFusionConfig:
     lock_min_total_votes: float = 8.0
     max_frames_per_segment: int = 8
     ocr_lang: str = "rus+eng"
+    ocr_workers: int = 1
     participants: tuple[str, ...] = ()
 
 
@@ -96,6 +98,7 @@ def run_video_speaker_fusion(
     participant_source = "provided" if config.participants else "ocr_discovery"
     normalized_participants = _normalize_participants(config.participants)
     participants_for_matching = [name for _, name in normalized_participants]
+    ocr_workers = max(1, int(config.ocr_workers))
 
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -104,6 +107,17 @@ def run_video_speaker_fusion(
             "status": "skipped",
             "reason": "cannot_open_video_stream",
         }
+    ocr_executor: Executor | None = None
+    if ocr_workers > 1:
+        ocr_executor = ThreadPoolExecutor(
+            max_workers=ocr_workers,
+            thread_name_prefix="fusion-ocr",
+        )
+
+    def _cleanup() -> None:
+        cap.release()
+        if ocr_executor is not None:
+            ocr_executor.shutdown(wait=True)
 
     fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
     duration_sec = _safe_duration(cap, fps)
@@ -124,7 +138,7 @@ def run_video_speaker_fusion(
     )
 
     if not speaker_windows:
-        cap.release()
+        _cleanup()
         return {
             "enabled": True,
             "status": "skipped",
@@ -141,6 +155,7 @@ def run_video_speaker_fusion(
             profile=resolved_profile,
             pytesseract_module=pytesseract,
             cv2_module=cv2,
+            ocr_executor=ocr_executor,
         )
         normalized_participants = _normalize_participants(tuple(discovered))
         participants_for_matching = [name for _, name in normalized_participants]
@@ -148,7 +163,7 @@ def run_video_speaker_fusion(
     # If OCR discovery cannot find reliable candidates, prefer safe fallback:
     # leave SPEAKER_XX unchanged instead of injecting noisy names.
     if participant_source == "ocr_discovery" and not participants_for_matching:
-        cap.release()
+        _cleanup()
         return {
             "enabled": True,
             "status": "skipped",
@@ -201,6 +216,7 @@ def run_video_speaker_fusion(
                 profile=resolved_profile,
                 pytesseract_module=pytesseract,
                 cv2_module=cv2,
+                ocr_executor=ocr_executor,
             )
             frame_reads += frames_used
             state.processed_segments += 1
@@ -277,7 +293,7 @@ def run_video_speaker_fusion(
 
         speaker_states[speaker_label] = state
 
-    cap.release()
+    _cleanup()
 
     speaker_mapping: dict[str, dict[str, Any]] = {}
     for speaker_label, state in speaker_states.items():
@@ -333,6 +349,7 @@ def run_video_speaker_fusion(
         "lock_min_total_votes": config.lock_min_total_votes,
         "max_frames_per_segment": config.max_frames_per_segment,
         "ocr_lang": config.ocr_lang,
+        "ocr_workers": ocr_workers,
         "participants": participants_for_matching,
         "speakers": speaker_mapping,
         "stats": {
@@ -463,6 +480,7 @@ def _discover_participants(
     profile: VideoProfile,
     pytesseract_module: Any,
     cv2_module: Any,
+    ocr_executor: Executor | None = None,
 ) -> list[str]:
     if duration_sec is None or duration_sec <= 0:
         sample_times = [0.0, 10.0, 20.0]
@@ -481,12 +499,14 @@ def _discover_participants(
         if frame is None:
             continue
         strips = _build_name_regions(frame, active_tile=None, profile=profile)
-        for strip in strips:
-            for text in _ocr_lines(strip, ocr_lang, pytesseract_module, cv2_module):
-                for candidate in _extract_name_fragments(text):
-                    cleaned = _clean_text_candidate(candidate)
-                    if cleaned:
-                        candidates[cleaned] += 1
+        for cleaned in _ocr_region_candidates_batch(
+            strips,
+            ocr_lang=ocr_lang,
+            pytesseract_module=pytesseract_module,
+            cv2_module=cv2_module,
+            ocr_executor=ocr_executor,
+        ):
+            candidates[cleaned] += 1
 
     min_hits = 2 if profile == "yandex_telemost" else 3
     discovered = [
@@ -521,10 +541,16 @@ def _analyze_segment_window(
     profile: VideoProfile,
     pytesseract_module: Any,
     cv2_module: Any,
+    ocr_executor: Executor | None = None,
 ) -> tuple[Counter[str], int, dict[str, Any]]:
     votes: Counter[str] = Counter()
     frames = 0
     active_tile_detections = 0
+    frame_tile_scores: list[float] = []
+    frame_best_names: list[str | None] = []
+    frame_best_scores: list[float] = []
+    task_regions: list[Any] = []
+    task_frame_indexes: list[int] = []
 
     timestamps = _segment_timestamps(
         start_sec,
@@ -547,30 +573,46 @@ def _analyze_segment_window(
             active_tile_detections += 1
 
         regions = _build_name_regions(frame, active_tile, profile=profile)
-
-        best_name = None
-        best_score = 0.0
+        frame_index = len(frame_tile_scores)
+        frame_tile_scores.append(tile_score)
+        frame_best_names.append(None)
+        frame_best_scores.append(0.0)
 
         for region in regions:
-            lines = _ocr_lines(region, ocr_lang, pytesseract_module, cv2_module)
-            for line in lines:
-                for candidate in _extract_name_fragments(line):
-                    cleaned = _clean_text_candidate(candidate)
-                    if not cleaned:
-                        continue
+            task_regions.append(region)
+            task_frame_indexes.append(frame_index)
 
-                    matched_name, name_score = _match_name(
-                        cleaned,
-                        participants,
-                        normalized_participants,
-                    )
-                    if matched_name and name_score > best_score:
-                        best_name = matched_name
-                        best_score = name_score
+    if task_regions:
+        grouped_candidates = _ocr_region_candidates_groups(
+            task_regions,
+            ocr_lang=ocr_lang,
+            pytesseract_module=pytesseract_module,
+            cv2_module=cv2_module,
+            ocr_executor=ocr_executor,
+        )
+        for task_idx, candidates in enumerate(grouped_candidates):
+            frame_index = task_frame_indexes[task_idx]
+            best_name = frame_best_names[frame_index]
+            best_score = frame_best_scores[frame_index]
+            for cleaned in candidates:
+                matched_name, name_score = _match_name(
+                    cleaned,
+                    participants,
+                    normalized_participants,
+                )
+                if matched_name and name_score > best_score:
+                    best_name = matched_name
+                    best_score = name_score
+            frame_best_names[frame_index] = best_name
+            frame_best_scores[frame_index] = best_score
 
-        if best_name:
-            weighted_score = best_score * (1.0 + tile_score)
-            votes[best_name] += weighted_score
+    for frame_index, best_name in enumerate(frame_best_names):
+        if not best_name:
+            continue
+        tile_score = frame_tile_scores[frame_index]
+        best_score = frame_best_scores[frame_index]
+        weighted_score = best_score * (1.0 + tile_score)
+        votes[best_name] += weighted_score
 
     evidence = {
         "active_tile_ratio": round(
@@ -942,6 +984,91 @@ def _ocr_lines(
         seen.add(line)
         unique_lines.append(line)
     return unique_lines
+
+
+def _ocr_region_candidates(
+    region: Any,
+    ocr_lang: str,
+    pytesseract_module: Any,
+    cv2_module: Any,
+) -> list[str]:
+    candidates: list[str] = []
+    for text in _ocr_lines(region, ocr_lang, pytesseract_module, cv2_module):
+        for fragment in _extract_name_fragments(text):
+            cleaned = _clean_text_candidate(fragment)
+            if cleaned:
+                candidates.append(cleaned)
+
+    # Preserve order while de-duplicating.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for candidate in candidates:
+        key = candidate.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(candidate)
+    return unique
+
+
+def _ocr_region_candidates_batch(
+    regions: list[Any],
+    *,
+    ocr_lang: str,
+    pytesseract_module: Any,
+    cv2_module: Any,
+    ocr_executor: Executor | None,
+) -> list[str]:
+    grouped = _ocr_region_candidates_groups(
+        regions,
+        ocr_lang=ocr_lang,
+        pytesseract_module=pytesseract_module,
+        cv2_module=cv2_module,
+        ocr_executor=ocr_executor,
+    )
+
+    combined: list[str] = []
+    seen: set[str] = set()
+    for group in grouped:
+        for candidate in group:
+            key = candidate.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(candidate)
+    return combined
+
+
+def _ocr_region_candidates_groups(
+    regions: list[Any],
+    *,
+    ocr_lang: str,
+    pytesseract_module: Any,
+    cv2_module: Any,
+    ocr_executor: Executor | None,
+) -> list[list[str]]:
+    if not regions:
+        return []
+
+    if ocr_executor is not None and len(regions) > 1:
+        mapped = ocr_executor.map(
+            _ocr_region_candidates,
+            regions,
+            [ocr_lang] * len(regions),
+            [pytesseract_module] * len(regions),
+            [cv2_module] * len(regions),
+        )
+        return list(mapped)
+
+    return [
+        _ocr_region_candidates(
+            region,
+            ocr_lang=ocr_lang,
+            pytesseract_module=pytesseract_module,
+            cv2_module=cv2_module,
+        )
+        for region in regions
+    ]
 
 
 def _extract_name_fragments(text: str) -> list[str]:

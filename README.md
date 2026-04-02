@@ -217,6 +217,7 @@ uv run python transcribe_whisperx.py meeting.webm \
 - после достижения порога уверенности speaker mapping lock'ается;
 - после lock по умолчанию обрабатывается только каждый 6-й сегмент для верификации;
 - порог уверенности конфигурируемый, по умолчанию `80%`.
+- OCR можно распараллелить по CPU через `--video-ocr-workers` (по умолчанию `1`);
 - есть профиль эвристик `--video-profile`:
   - `auto` (по умолчанию) — пытается определить Телемост по видеопотоку;
   - `generic` — универсальные эвристики;
@@ -227,6 +228,8 @@ uv run python transcribe_whisperx.py meeting.webm \
   и остаются исходные `SPEAKER_XX` (это безопасный fallback без ложных имен);
 - для максимальной точности рекомендуется передавать `--video-participants`
   или `--video-participants-file`.
+- текущая реализация fusion использует `cv2 + tesseract` и работает на CPU;
+  если нужен GPU-режим, потребуется отдельный OCR backend (например EasyOCR/PaddleOCR).
 
 Пример запуска:
 
@@ -235,6 +238,7 @@ uv run python transcribe_whisperx.py meeting.webm \
   --hf-token "$HF_TOKEN" \
   --video-speaker-fusion \
   --video-profile auto \
+  --video-ocr-workers 4 \
   --video-speaker-confidence-threshold 80 \
   --video-lock-verify-every 6
 ```
