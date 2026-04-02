@@ -9,8 +9,9 @@ from typing import Any, Literal
 
 from llm_summary import (
     add_summary_args,
-    default_summary_output_path,
-    request_summary,
+    default_mode_output_path,
+    mode_output_label,
+    request_summary_mode,
     save_summary,
 )
 
@@ -20,7 +21,8 @@ SpeakerFormat = Literal["auto", "always", "never"]
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Сделать LLM-саммари по уже готовому JSON транскрибации "
+            "Сделать LLM-генерацию (саммари/конспект/демо-отчет) "
+            "по уже готовому JSON транскрибации "
             "(transcribe_webm/transcribe_whisperx)."
         )
     )
@@ -34,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("auto", "always", "never"),
         default="auto",
         help=(
-            "Формат входа для саммари: auto (по умолчанию), always "
+            "Формат входа для генерации: auto (по умолчанию), always "
             "(принудительно по спикерам), never (только plain text)."
         ),
     )
@@ -164,9 +166,13 @@ def main() -> int:
             data,
             speaker_format=args.speaker_format,
         )
-        print(f"[info] Источник текста для саммари: {source}")
-        summary_text = request_summary(
+        print(
+            f"[info] Источник текста для генерации: {source}; "
+            f"mode={args.summary_mode}"
+        )
+        summary_text = request_summary_mode(
             transcript_text=transcript_text,
+            summary_mode=args.summary_mode,
             base_url=args.summary_base_url,
             model=args.summary_model,
             api_key=args.summary_api_key,
@@ -180,13 +186,14 @@ def main() -> int:
         )
         output_path = save_summary(
             summary_text,
-            args.summary_output or default_summary_output_path(args.input_json),
+            args.summary_output
+            or default_mode_output_path(args.input_json, args.summary_mode),
         )
     except Exception as exc:  # noqa: BLE001
         print(f"[error] {exc}", file=sys.stderr)
         return 1
 
-    print(f"[ok] SUMMARY: {output_path}")
+    print(f"[ok] {mode_output_label(args.summary_mode)}: {output_path}")
     return 0
 
 

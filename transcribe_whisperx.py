@@ -14,8 +14,9 @@ from typing import Any, Literal
 
 from llm_summary import (
     add_summary_args,
-    default_summary_output_path,
-    request_summary,
+    default_mode_output_path,
+    mode_output_label,
+    request_summary_mode,
     save_summary,
 )
 
@@ -444,7 +445,7 @@ def run_whisperx_pipeline(
     # Known pyannote warning is very verbose and non-fatal for our pipeline.
     warnings.filterwarnings(
         "ignore",
-        message=".*torchcodec is not installed correctly.*",
+        message="(?s).*torchcodec is not installed correctly.*",
         category=UserWarning,
     )
 
@@ -649,11 +650,12 @@ def main() -> int:
         )
 
         if args.summarize:
-            print("[info] Запускаю LLM-саммари...")
+            print(f"[info] Запускаю LLM-генерацию (mode={args.summary_mode})...")
             speaker_text = to_speaker_text(result.get("segments", []))
             transcript_for_summary = speaker_text.strip() or result.get("text", "").strip()
-            summary_text = request_summary(
+            summary_text = request_summary_mode(
                 transcript_text=transcript_for_summary,
+                summary_mode=args.summary_mode,
                 base_url=args.summary_base_url,
                 model=args.summary_model,
                 api_key=args.summary_api_key,
@@ -667,7 +669,8 @@ def main() -> int:
             )
             summary_path = save_summary(
                 summary_text,
-                args.summary_output or default_summary_output_path(txt_path),
+                args.summary_output
+                or default_mode_output_path(txt_path, args.summary_mode),
             )
     except Exception as exc:  # noqa: BLE001
         print(f"[error] {exc}", file=sys.stderr)
@@ -682,12 +685,48 @@ def main() -> int:
         status = str(video_meta.get("status", "unknown"))
         requested_profile = str(video_meta.get("requested_profile", args.video_profile))
         resolved_profile = str(video_meta.get("resolved_profile", requested_profile))
-        print(
-            f"[ok] Video fusion: {status} "
-            f"(profile={resolved_profile}, requested={requested_profile})"
+        reason = str(video_meta.get("reason", "")).strip()
+        details = f"profile={resolved_profile}, requested={requested_profile}"
+        if reason:
+            details = f"{details}, reason={reason}"
+        print(f"[ok] Video fusion: {status} ({details})")
+
+        fused_speakers = video_meta.get("speakers", {})
+        confidence_values: list[float] = []
+        if isinstance(fused_speakers, dict):
+            for payload in fused_speakers.values():
+                if not isinstance(payload, dict):
+                    continue
+                confidence = payload.get("confidence")
+                if confidence is None:
+                    continue
+                try:
+                    confidence_values.append(float(confidence) * 100.0)
+                except (TypeError, ValueError):
+                    continue
+
+        avg_conf = (
+            (sum(confidence_values) / len(confidence_values))
+            if confidence_values
+            else 0.0
         )
+        max_conf = max(confidence_values) if confidence_values else 0.0
+        print(
+            "[info] Video fusion confidence: "
+            f"avg={avg_conf:.1f}% max={max_conf:.1f}% "
+            f"(speakers_with_score={len(confidence_values)})"
+        )
+
+        if status != "ok":
+            participants_source = video_meta.get("participants_source")
+            participants = video_meta.get("participants")
+            if participants_source is not None:
+                print(
+                    "[info] Video fusion details: "
+                    f"participants_source={participants_source}, "
+                    f"participants_found={len(participants) if isinstance(participants, list) else 0}"
+                )
         if status == "ok":
-            fused_speakers = video_meta.get("speakers", {})
             if isinstance(fused_speakers, dict):
                 resolved_lines: list[str] = []
                 for speaker_id, payload in fused_speakers.items():
@@ -708,7 +747,7 @@ def main() -> int:
     print(f"[ok] TXT:  {txt_path}")
     print(f"[ok] JSON: {json_path}")
     if summary_path:
-        print(f"[ok] SUMMARY: {summary_path}")
+        print(f"[ok] {mode_output_label(args.summary_mode)}: {summary_path}")
     return 0
 
 

@@ -5,8 +5,10 @@ import json
 import os
 import socket
 import time
+from dataclasses import dataclass
+from http.client import IncompleteRead, RemoteDisconnected
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -22,9 +24,153 @@ DEFAULT_SUMMARY_PROMPT = (
     "(если это можно однозначно понять из текста).\n"
     "5. Главные выводы или итоги обсуждения."
 )
+
+DEFAULT_LECTURE_PROMPT = (
+    "Ты мой AI-методист по анализу образовательных стенограмм. "
+    "Ниже будет текст лекции или воркшопа. Подготовь подробный и практичный "
+    "конспект на русском языке. Структура ответа:\n"
+    "1. Краткий конспект лекции: 8-15 тезисов в порядке изложения.\n"
+    "2. Тема лекции и контекст (о чем лекция и для кого).\n"
+    "3. Подробный план и основные разделы (в порядке изложения).\n"
+    "4. Ключевые понятия, определения, формулы/правила (если есть).\n"
+    "5. Примеры, кейсы, демонстрации и разборы, которые приводил спикер.\n"
+    "6. Практические шаги, рекомендации и чек-листы для применения.\n"
+    "7. Вопросы аудитории и ответы спикера (если были).\n"
+    "8. Итоговые выводы и что стоит изучить дальше.\n"
+    "Не придумывай факты, которых нет в тексте стенограммы."
+)
+
+DEFAULT_DEMO_PROMPT = (
+    "Ты мой AI-ассистент для подготовки отчета по scrum-демо. "
+    "Ниже будет стенограмма встречи, где команда показывает итоги разработки. "
+    "Сделай структурированный отчет на русском языке. Структура ответа:\n"
+    "1. Краткий конспект демо: 6-12 тезисов с главными показанными результатами.\n"
+    "2. Что было продемонстрировано: фичи, улучшения, исправления (по пунктам).\n"
+    "3. Статус по целям спринта: что завершено, что частично готово, что перенесено.\n"
+    "4. Решения и договоренности команды по итогам демо.\n"
+    "5. Обратная связь, вопросы и замечания от участников (если были).\n"
+    "6. Риски, блокеры и технические долги, озвученные на демо.\n"
+    "7. Следующие шаги: приоритеты, владельцы и ближайшие действия (если можно определить).\n"
+    "Не придумывай факты, которых нет в тексте стенограммы."
+)
+
 DEFAULT_SUMMARY_CHUNK_CHARS = int(os.getenv("SUMMARY_CHUNK_CHARS", "32000"))
 DEFAULT_SUMMARY_CHUNK_OVERLAP_CHARS = int(
     os.getenv("SUMMARY_CHUNK_OVERLAP_CHARS", "3000")
+)
+
+SummaryMode = Literal["summary", "lecture", "demo"]
+
+
+@dataclass(frozen=True)
+class GenerationProfile:
+    mode: SummaryMode
+    display_name: str
+    default_prompt: str
+    output_suffix: str
+    single_user_prefix: str
+    chunk_user_template: str
+    reduce_system_prompt: str
+    reduce_user_prefix: str
+    final_user_prefix: str
+    intermediate_label: str
+    empty_input_error: str
+
+
+SUMMARY_PROFILE = GenerationProfile(
+    mode="summary",
+    display_name="Саммари",
+    default_prompt=DEFAULT_SUMMARY_PROMPT,
+    output_suffix=".summary.md",
+    single_user_prefix=(
+        "Ниже стенограмма разговора. "
+        "Подготовь структурированное саммари по инструкции."
+    ),
+    chunk_user_template=(
+        "Ниже часть стенограммы разговора. "
+        "Это часть {idx} из {total}. "
+        "Сделай структурированное саммари ТОЛЬКО по этой части "
+        "и не придумывай факты вне текста.\n\n{chunk}"
+    ),
+    reduce_system_prompt=(
+        "Ты объединяешь промежуточные саммари одной и той же встречи. "
+        "Сохраняй факты, убирай дубли, не добавляй новых деталей."
+    ),
+    reduce_user_prefix=(
+        "Ниже несколько промежуточных саммари частей одной встречи. "
+        "Объедини их в единое краткое саммари без повторов и без новых фактов."
+    ),
+    final_user_prefix=(
+        "Ниже промежуточные саммари частей одной и той же встречи. "
+        "Собери единое итоговое структурированное саммари строго по инструкции. "
+        "Не добавляй факты, которых нет в промежуточных саммари."
+    ),
+    intermediate_label="Промежуточное саммари",
+    empty_input_error="Пустая стенограмма для саммари.",
+)
+
+LECTURE_PROFILE = GenerationProfile(
+    mode="lecture",
+    display_name="Конспект",
+    default_prompt=DEFAULT_LECTURE_PROMPT,
+    output_suffix=".lecture.md",
+    single_user_prefix=(
+        "Ниже стенограмма лекции или воркшопа. "
+        "Подготовь подробный конспект по инструкции."
+    ),
+    chunk_user_template=(
+        "Ниже часть стенограммы лекции/воркшопа. "
+        "Это часть {idx} из {total}. "
+        "Сделай подробный конспект ТОЛЬКО по этой части "
+        "и не придумывай факты вне текста.\n\n{chunk}"
+    ),
+    reduce_system_prompt=(
+        "Ты объединяешь промежуточные конспекты одной и той же лекции. "
+        "Сохраняй факты, убирай дубли и не добавляй новых деталей."
+    ),
+    reduce_user_prefix=(
+        "Ниже несколько промежуточных конспектов частей одной лекции/воркшопа. "
+        "Объедини их в единый цельный конспект без повторов и без новых фактов."
+    ),
+    final_user_prefix=(
+        "Ниже промежуточные конспекты частей одной и той же лекции/воркшопа. "
+        "Собери единый подробный итоговый конспект строго по инструкции. "
+        "Не добавляй факты, которых нет в промежуточных конспектах."
+    ),
+    intermediate_label="Промежуточный конспект",
+    empty_input_error="Пустая стенограмма для конспекта лекции.",
+)
+
+DEMO_PROFILE = GenerationProfile(
+    mode="demo",
+    display_name="Демо-отчет",
+    default_prompt=DEFAULT_DEMO_PROMPT,
+    output_suffix=".demo.md",
+    single_user_prefix=(
+        "Ниже стенограмма scrum-демо с показом итогов разработки. "
+        "Подготовь структурированный отчет по инструкции."
+    ),
+    chunk_user_template=(
+        "Ниже часть стенограммы scrum-демо. "
+        "Это часть {idx} из {total}. "
+        "Сделай структурированный отчет ТОЛЬКО по этой части "
+        "и не придумывай факты вне текста.\n\n{chunk}"
+    ),
+    reduce_system_prompt=(
+        "Ты объединяешь промежуточные отчеты по одному и тому же scrum-демо. "
+        "Сохраняй факты, убирай дубли и не добавляй новых деталей."
+    ),
+    reduce_user_prefix=(
+        "Ниже несколько промежуточных отчетов частей одного scrum-демо. "
+        "Объедини их в единый цельный отчет без повторов и без новых фактов."
+    ),
+    final_user_prefix=(
+        "Ниже промежуточные отчеты частей одного и того же scrum-демо. "
+        "Собери единый итоговый отчет строго по инструкции. "
+        "Не добавляй факты, которых нет в промежуточных отчетах."
+    ),
+    intermediate_label="Промежуточный отчет",
+    empty_input_error="Пустая стенограмма для отчета по demo-встрече.",
 )
 
 
@@ -37,8 +183,18 @@ def add_summary_args(
         parser.add_argument(
             "--summarize",
             action="store_true",
-            help="После транскрибации дополнительно сделать саммари через OpenAI-compatible API (LM Studio).",
+            help="После транскрибации дополнительно сгенерировать текст через OpenAI-compatible API (LM Studio).",
         )
+    parser.add_argument(
+        "--summary-mode",
+        choices=("summary", "lecture", "demo"),
+        default=normalize_summary_mode(os.getenv("SUMMARY_MODE", "summary")),
+        help=(
+            "Режим генерации: summary (итоги встречи, по умолчанию) "
+            "или lecture (подробный конспект лекции/воркшопа), "
+            "или demo (отчет по scrum-демо итогов разработки)."
+        ),
+    )
     parser.add_argument(
         "--summary-base-url",
         default=os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:1234/v1"),
@@ -58,25 +214,25 @@ def add_summary_args(
         "--summary-temperature",
         type=float,
         default=0.1,
-        help="Temperature для генерации саммари (по умолчанию: 0.1)",
+        help="Temperature для генерации текста (по умолчанию: 0.1)",
     )
     parser.add_argument(
         "--summary-timeout",
         type=int,
         default=300,
-        help="Таймаут HTTP-запроса на саммари в секундах (по умолчанию: 300)",
+        help="Таймаут HTTP-запроса в секундах (по умолчанию: 300)",
     )
     parser.add_argument(
         "--summary-retries",
         type=int,
         default=3,
-        help="Количество попыток запроса саммари (по умолчанию: 3)",
+        help="Количество попыток запроса (по умолчанию: 3)",
     )
     parser.add_argument(
         "--summary-retry-delay",
         type=float,
         default=2.0,
-        help="Пауза между попытками саммари в секундах (по умолчанию: 2.0)",
+        help="Пауза между попытками в секундах (по умолчанию: 2.0)",
     )
     parser.add_argument(
         "--summary-chunk-chars",
@@ -100,23 +256,84 @@ def add_summary_args(
         "--summary-output",
         type=Path,
         default=None,
-        help="Куда сохранить саммари (по умолчанию: рядом с транскриптом, *.summary.md)",
+        help=(
+            "Куда сохранить результат. По умолчанию: *.summary.md для режима summary "
+            "и *.lecture.md для режима lecture, и *.demo.md для режима demo."
+        ),
     )
     parser.add_argument(
         "--summary-prompt",
-        default=DEFAULT_SUMMARY_PROMPT,
-        help="Промпт для саммари. Можно передать свой.",
+        default=None,
+        help=(
+            "Кастомный system prompt. По умолчанию берется встроенный промпт "
+            "в зависимости от --summary-mode."
+        ),
     )
 
 
+def normalize_summary_mode(mode: str) -> SummaryMode:
+    normalized = mode.strip().lower()
+    if normalized == "lecture":
+        return "lecture"
+    if normalized == "demo":
+        return "demo"
+    return "summary"
+
+
+def _profile_for_mode(summary_mode: SummaryMode) -> GenerationProfile:
+    if summary_mode == "lecture":
+        return LECTURE_PROFILE
+    if summary_mode == "demo":
+        return DEMO_PROFILE
+    return SUMMARY_PROFILE
+
+
+def resolve_summary_prompt(
+    summary_mode: SummaryMode,
+    prompt_override: str | None,
+) -> str:
+    custom = (prompt_override or "").strip()
+    if custom:
+        return custom
+    return _profile_for_mode(summary_mode).default_prompt
+
+
+def default_mode_output_path(
+    transcript_txt_path: Path,
+    summary_mode: SummaryMode,
+) -> Path:
+    profile = _profile_for_mode(summary_mode)
+    return transcript_txt_path.with_suffix(profile.output_suffix)
+
+
 def default_summary_output_path(transcript_txt_path: Path) -> Path:
-    return transcript_txt_path.with_suffix(".summary.md")
+    return default_mode_output_path(transcript_txt_path, "summary")
+
+
+def default_lecture_output_path(transcript_txt_path: Path) -> Path:
+    return default_mode_output_path(transcript_txt_path, "lecture")
+
+
+def default_demo_output_path(transcript_txt_path: Path) -> Path:
+    return default_mode_output_path(transcript_txt_path, "demo")
+
+
+def mode_output_label(summary_mode: SummaryMode) -> str:
+    if summary_mode == "lecture":
+        return "LECTURE"
+    if summary_mode == "demo":
+        return "DEMO"
+    return "SUMMARY"
+
+
+def save_generated_text(generated_text: str, output_path: Path) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(generated_text.strip() + "\n", encoding="utf-8")
+    return output_path
 
 
 def save_summary(summary_text: str, output_path: Path) -> Path:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(summary_text.strip() + "\n", encoding="utf-8")
-    return output_path
+    return save_generated_text(summary_text, output_path)
 
 
 def _extract_content(chat_response: dict[str, Any]) -> str:
@@ -198,13 +415,18 @@ def _format_blocks(blocks: list[str], label: str) -> str:
     return "\n\n".join(parts).strip()
 
 
-def _group_blocks_for_reduce(blocks: list[str], *, max_chars: int) -> list[str]:
+def _group_blocks_for_reduce(
+    blocks: list[str],
+    *,
+    max_chars: int,
+    entry_label: str,
+) -> list[str]:
     groups: list[str] = []
     current: list[str] = []
     current_len = 0
 
     for idx, block in enumerate(blocks, start=1):
-        entry = f"Промежуточное саммари {idx}:\n{block.strip()}\n"
+        entry = f"{entry_label} {idx}:\n{block.strip()}\n"
         entry_len = len(entry)
 
         if entry_len > max_chars:
@@ -236,7 +458,7 @@ def _group_blocks_for_reduce(blocks: list[str], *, max_chars: int) -> list[str]:
     return [group for group in groups if group]
 
 
-def _request_summary_single(
+def _request_single_generation(
     user_content: str,
     *,
     base_url: str,
@@ -245,8 +467,9 @@ def _request_summary_single(
     prompt: str,
     temperature: float,
     timeout: int,
-    retries: int = 3,
-    retry_delay: float = 2.0,
+    retries: int,
+    retry_delay: float,
+    mode_label: str,
 ) -> str:
     endpoint = f"{base_url.rstrip('/')}/chat/completions"
     headers = {"Content-Type": "application/json"}
@@ -277,13 +500,12 @@ def _request_summary_single(
                 body = response.read().decode("utf-8")
 
             parsed = json.loads(body)
-            summary = _extract_content(parsed)
-            if not summary:
-                raise RuntimeError("LLM вернул пустое саммари.")
-            return summary
+            generated = _extract_content(parsed)
+            if not generated:
+                raise RuntimeError("LLM вернул пустой результат.")
+            return generated
         except HTTPError as exc:
             error_body = exc.read().decode("utf-8", errors="ignore")
-            # Retry only for transient HTTP failures.
             retryable = exc.code >= 500 or exc.code in {408, 409, 429}
             last_error = RuntimeError(
                 f"Ошибка LLM API ({exc.code}): {error_body or exc.reason}"
@@ -291,22 +513,37 @@ def _request_summary_single(
             if not retryable or attempt >= attempts:
                 raise last_error from exc
         except URLError as exc:
+            raw_reason = exc.reason
+            if isinstance(raw_reason, BaseException):
+                reason_text = f"{type(raw_reason).__name__}: {raw_reason}"
+            else:
+                reason_text = str(raw_reason)
             if isinstance(exc.reason, (TimeoutError, socket.timeout)):
                 last_error = RuntimeError(
                     "Таймаут ожидания ответа от LLM API. "
-                    "Увеличьте --summary-timeout или уменьшите размер стенограммы."
+                    "Увеличьте --summary-timeout или уменьшите размер стенограммы. "
+                    f"Причина: {reason_text}"
                 )
             else:
                 last_error = RuntimeError(
                     "Не удалось подключиться к LLM API. "
-                    "Проверьте, что LM Studio запущен и API доступен."
+                    "Проверьте URL, API key и сетевой доступ. "
+                    f"Причина: {reason_text}"
                 )
+            if attempt >= attempts:
+                raise last_error from exc
+        except (IncompleteRead, RemoteDisconnected) as exc:
+            last_error = RuntimeError(
+                "Соединение с LLM API было прервано до получения полного ответа. "
+                f"Причина: {type(exc).__name__}: {exc}"
+            )
             if attempt >= attempts:
                 raise last_error from exc
         except (TimeoutError, socket.timeout) as exc:
             last_error = RuntimeError(
                 "Таймаут ожидания ответа от LLM API. "
-                "Увеличьте --summary-timeout или уменьшите размер стенограммы."
+                "Увеличьте --summary-timeout или уменьшите размер стенограммы. "
+                f"Причина: {type(exc).__name__}: {exc}"
             )
             if attempt >= attempts:
                 raise last_error from exc
@@ -320,24 +557,26 @@ def _request_summary_single(
                 raise
 
         sleep_seconds = max(0.0, retry_delay) * attempt
+        error_hint = str(last_error) if last_error else "неизвестная ошибка"
         print(
-            f"[warn] Саммари: попытка {attempt}/{attempts} не удалась. "
+            f"[warn] {mode_label}: попытка {attempt}/{attempts} не удалась: {error_hint}. "
             f"Повтор через {sleep_seconds:.1f}с..."
         )
         time.sleep(sleep_seconds)
 
     if last_error is not None:
         raise last_error
-    raise RuntimeError("Не удалось получить саммари по неизвестной причине.")
+    raise RuntimeError("Не удалось получить результат по неизвестной причине.")
 
 
-def request_summary(
+def request_summary_mode(
     transcript_text: str,
     *,
+    summary_mode: SummaryMode,
     base_url: str,
     model: str,
     api_key: str | None,
-    prompt: str,
+    prompt: str | None,
     temperature: float,
     timeout: int,
     retries: int = 3,
@@ -345,9 +584,12 @@ def request_summary(
     chunk_chars: int = DEFAULT_SUMMARY_CHUNK_CHARS,
     chunk_overlap_chars: int = DEFAULT_SUMMARY_CHUNK_OVERLAP_CHARS,
 ) -> str:
+    profile = _profile_for_mode(summary_mode)
+    effective_prompt = resolve_summary_prompt(summary_mode, prompt)
+
     normalized = transcript_text.strip()
     if not normalized:
-        raise RuntimeError("Пустая стенограмма для саммари.")
+        raise RuntimeError(profile.empty_input_error)
 
     safe_chunk_chars = max(1000, chunk_chars)
     safe_overlap = max(0, chunk_overlap_chars)
@@ -358,96 +600,124 @@ def request_summary(
     )
 
     if len(chunks) <= 1:
-        return _request_summary_single(
+        return _request_single_generation(
             user_content=(
-                "Ниже стенограмма разговора. "
-                "Подготовь структурированное саммари по инструкции.\n\n"
+                f"{profile.single_user_prefix}\n\n"
                 f"{normalized}"
             ),
             base_url=base_url,
             model=model,
             api_key=api_key,
-            prompt=prompt,
+            prompt=effective_prompt,
             temperature=temperature,
             timeout=timeout,
             retries=retries,
             retry_delay=retry_delay,
+            mode_label=profile.display_name,
         )
 
     print(
-        f"[info] Саммари: длинная стенограмма, делю на чанки: {len(chunks)} "
-        f"(chunk_chars={safe_chunk_chars}, overlap={safe_overlap})"
+        f"[info] {profile.display_name}: длинная стенограмма, делю на чанки: "
+        f"{len(chunks)} (chunk_chars={safe_chunk_chars}, overlap={safe_overlap})"
     )
-    partial_summaries: list[str] = []
+    partial_outputs: list[str] = []
 
     for idx, chunk in enumerate(chunks, start=1):
-        print(f"[info] Саммари: обрабатываю чанк {idx}/{len(chunks)}...")
-        partial = _request_summary_single(
-            user_content=(
-                "Ниже часть стенограммы разговора. "
-                f"Это часть {idx} из {len(chunks)}. "
-                "Сделай структурированное саммари ТОЛЬКО по этой части "
-                "и не придумывай факты вне текста.\n\n"
-                f"{chunk}"
+        print(f"[info] {profile.display_name}: обрабатываю чанк {idx}/{len(chunks)}...")
+        partial = _request_single_generation(
+            user_content=profile.chunk_user_template.format(
+                idx=idx,
+                total=len(chunks),
+                chunk=chunk,
             ),
             base_url=base_url,
             model=model,
             api_key=api_key,
-            prompt=prompt,
+            prompt=effective_prompt,
             temperature=temperature,
             timeout=timeout,
             retries=retries,
             retry_delay=retry_delay,
+            mode_label=profile.display_name,
         )
-        partial_summaries.append(partial)
+        partial_outputs.append(partial)
 
-    reduce_prompt = (
-        "Ты объединяешь промежуточные саммари одной и той же встречи. "
-        "Сохраняй факты, убирай дубли, не добавляй новых деталей."
-    )
     reduce_round = 1
-    current = [item.strip() for item in partial_summaries if item.strip()]
+    current = [item.strip() for item in partial_outputs if item.strip()]
 
     while len(current) > 1:
-        grouped = _group_blocks_for_reduce(current, max_chars=safe_chunk_chars)
+        grouped = _group_blocks_for_reduce(
+            current,
+            max_chars=safe_chunk_chars,
+            entry_label=profile.intermediate_label,
+        )
         if len(grouped) == 1:
             break
 
         print(
-            f"[info] Саммари: reduce-раунд {reduce_round}, групп для объединения: {len(grouped)}"
+            f"[info] {profile.display_name}: reduce-раунд {reduce_round}, "
+            f"групп для объединения: {len(grouped)}"
         )
         next_level: list[str] = []
         for group_idx, group_text in enumerate(grouped, start=1):
             print(
-                f"[info] Саммари: агрегирую группу {group_idx}/{len(grouped)}..."
+                f"[info] {profile.display_name}: агрегирую группу "
+                f"{group_idx}/{len(grouped)}..."
             )
-            reduced = _request_summary_single(
+            reduced = _request_single_generation(
                 user_content=(
-                    "Ниже несколько промежуточных саммари частей одной встречи. "
-                    "Объедини их в единое краткое саммари без повторов и без новых фактов.\n\n"
+                    f"{profile.reduce_user_prefix}\n\n"
                     f"{group_text}"
                 ),
                 base_url=base_url,
                 model=model,
                 api_key=api_key,
-                prompt=reduce_prompt,
+                prompt=profile.reduce_system_prompt,
                 temperature=temperature,
                 timeout=timeout,
                 retries=retries,
                 retry_delay=retry_delay,
+                mode_label=profile.display_name,
             )
             next_level.append(reduced)
         current = next_level
         reduce_round += 1
 
-    final_input = _format_blocks(current, "Промежуточное саммари")
-    return _request_summary_single(
+    final_input = _format_blocks(current, profile.intermediate_label)
+    return _request_single_generation(
         user_content=(
-            "Ниже промежуточные саммари частей одной и той же встречи. "
-            "Собери единое итоговое структурированное саммари строго по инструкции. "
-            "Не добавляй факты, которых нет в промежуточных саммари.\n\n"
+            f"{profile.final_user_prefix}\n\n"
             f"{final_input}"
         ),
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        prompt=effective_prompt,
+        temperature=temperature,
+        timeout=timeout,
+        retries=retries,
+        retry_delay=retry_delay,
+        mode_label=profile.display_name,
+    )
+
+
+def request_summary(
+    transcript_text: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    prompt: str | None,
+    temperature: float,
+    timeout: int,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    chunk_chars: int = DEFAULT_SUMMARY_CHUNK_CHARS,
+    chunk_overlap_chars: int = DEFAULT_SUMMARY_CHUNK_OVERLAP_CHARS,
+) -> str:
+    return request_summary_mode(
+        transcript_text,
+        summary_mode="summary",
         base_url=base_url,
         model=model,
         api_key=api_key,
@@ -456,4 +726,66 @@ def request_summary(
         timeout=timeout,
         retries=retries,
         retry_delay=retry_delay,
+        chunk_chars=chunk_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
+    )
+
+
+def request_lecture_description(
+    transcript_text: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    prompt: str | None,
+    temperature: float,
+    timeout: int,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    chunk_chars: int = DEFAULT_SUMMARY_CHUNK_CHARS,
+    chunk_overlap_chars: int = DEFAULT_SUMMARY_CHUNK_OVERLAP_CHARS,
+) -> str:
+    return request_summary_mode(
+        transcript_text,
+        summary_mode="lecture",
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        prompt=prompt,
+        temperature=temperature,
+        timeout=timeout,
+        retries=retries,
+        retry_delay=retry_delay,
+        chunk_chars=chunk_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
+    )
+
+
+def request_demo_report(
+    transcript_text: str,
+    *,
+    base_url: str,
+    model: str,
+    api_key: str | None,
+    prompt: str | None,
+    temperature: float,
+    timeout: int,
+    retries: int = 3,
+    retry_delay: float = 2.0,
+    chunk_chars: int = DEFAULT_SUMMARY_CHUNK_CHARS,
+    chunk_overlap_chars: int = DEFAULT_SUMMARY_CHUNK_OVERLAP_CHARS,
+) -> str:
+    return request_summary_mode(
+        transcript_text,
+        summary_mode="demo",
+        base_url=base_url,
+        model=model,
+        api_key=api_key,
+        prompt=prompt,
+        temperature=temperature,
+        timeout=timeout,
+        retries=retries,
+        retry_delay=retry_delay,
+        chunk_chars=chunk_chars,
+        chunk_overlap_chars=chunk_overlap_chars,
     )

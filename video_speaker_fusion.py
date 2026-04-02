@@ -483,16 +483,28 @@ def _discover_participants(
         strips = _build_name_regions(frame, active_tile=None, profile=profile)
         for strip in strips:
             for text in _ocr_lines(strip, ocr_lang, pytesseract_module, cv2_module):
-                cleaned = _clean_text_candidate(text)
-                if cleaned:
-                    candidates[cleaned] += 1
+                for candidate in _extract_name_fragments(text):
+                    cleaned = _clean_text_candidate(candidate)
+                    if cleaned:
+                        candidates[cleaned] += 1
 
     min_hits = 2 if profile == "yandex_telemost" else 3
     discovered = [
         name
         for name, count in candidates.most_common(25)
-        if count >= min_hits and _is_plausible_name_candidate(name)
+        if count >= min_hits
+        and _is_plausible_name_candidate(name)
+        and (profile != "yandex_telemost" or len(name.split()) >= 2)
     ][:15]
+    if profile == "yandex_telemost" and not discovered:
+        # Fallback for narrow top bars where OCR sees names rarely.
+        discovered = [
+            name
+            for name, count in candidates.most_common(25)
+            if count >= 1
+            and _is_plausible_name_candidate(name)
+            and len(name.split()) >= 2
+        ][:10]
     return discovered
 
 
@@ -542,18 +554,19 @@ def _analyze_segment_window(
         for region in regions:
             lines = _ocr_lines(region, ocr_lang, pytesseract_module, cv2_module)
             for line in lines:
-                cleaned = _clean_text_candidate(line)
-                if not cleaned:
-                    continue
+                for candidate in _extract_name_fragments(line):
+                    cleaned = _clean_text_candidate(candidate)
+                    if not cleaned:
+                        continue
 
-                matched_name, name_score = _match_name(
-                    cleaned,
-                    participants,
-                    normalized_participants,
-                )
-                if matched_name and name_score > best_score:
-                    best_name = matched_name
-                    best_score = name_score
+                    matched_name, name_score = _match_name(
+                        cleaned,
+                        participants,
+                        normalized_participants,
+                    )
+                    if matched_name and name_score > best_score:
+                        best_name = matched_name
+                        best_score = name_score
 
         if best_name:
             weighted_score = best_score * (1.0 + tile_score)
@@ -919,9 +932,6 @@ def _ocr_lines(
             candidate = raw.strip()
             if candidate:
                 lines.append(candidate)
-        # If single-line mode produced meaningful output, skip extra OCR passes.
-        if lines and psm == 7:
-            break
 
     # Preserve order while de-duplicating.
     seen: set[str] = set()
@@ -932,6 +942,37 @@ def _ocr_lines(
         seen.add(line)
         unique_lines.append(line)
     return unique_lines
+
+
+def _extract_name_fragments(text: str) -> list[str]:
+    base = re.sub(r"\s+", " ", text.strip())
+    if not base:
+        return []
+
+    fragments: list[str] = [base]
+    chunks: list[str] = []
+    # OCR of top ribbon often returns several names in one line separated by symbols.
+    for chunk in re.split(r"[|/&;,@№•·]+", base):
+        normalized_chunk = re.sub(r"\s+", " ", chunk).strip()
+        if normalized_chunk:
+            chunks.append(normalized_chunk)
+            fragments.append(normalized_chunk)
+
+    title_pair = re.compile(r"\b[A-ZА-ЯЁ][a-zа-яё]{2,}\s+[A-ZА-ЯЁ][a-zа-яё]{2,}\b")
+    for scope in [base, *chunks]:
+        fragments.extend(title_pair.findall(scope))
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for fragment in fragments:
+        cleaned = fragment.strip()
+        if not cleaned:
+            continue
+        if cleaned in seen:
+            continue
+        seen.add(cleaned)
+        unique.append(cleaned)
+    return unique
 
 
 def _clean_text_candidate(text: str) -> str | None:

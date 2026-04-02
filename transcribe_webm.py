@@ -13,8 +13,9 @@ from typing import Any, Literal
 
 from llm_summary import (
     add_summary_args,
-    default_summary_output_path,
-    request_summary,
+    default_mode_output_path,
+    mode_output_label,
+    request_summary_mode,
     save_summary,
 )
 
@@ -424,9 +425,10 @@ def main() -> int:
         )
 
         if args.summarize:
-            print("[info] Запускаю LLM-саммари...")
-            summary_text = request_summary(
+            print(f"[info] Запускаю LLM-генерацию (mode={args.summary_mode})...")
+            summary_text = request_summary_mode(
                 transcript_text=result["text"].strip(),
+                summary_mode=args.summary_mode,
                 base_url=args.summary_base_url,
                 model=args.summary_model,
                 api_key=args.summary_api_key,
@@ -440,7 +442,8 @@ def main() -> int:
             )
             summary_path = save_summary(
                 summary_text,
-                args.summary_output or default_summary_output_path(txt_path),
+                args.summary_output
+                or default_mode_output_path(txt_path, args.summary_mode),
             )
     except Exception as exc:  # noqa: BLE001
         print(f"[error] {exc}", file=sys.stderr)
@@ -450,7 +453,7 @@ def main() -> int:
     print(f"[ok] TXT:  {txt_path}")
     print(f"[ok] JSON: {json_path}")
     if summary_path:
-        print(f"[ok] SUMMARY: {summary_path}")
+        print(f"[ok] {mode_output_label(args.summary_mode)}: {summary_path}")
     print("\n=== Текст транскрибации ===\n")
     print(result["text"].strip())
     return 0

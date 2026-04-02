@@ -32,7 +32,9 @@ uv run python transcribe_whisperx.py meeting.webm \
 
 Результат:
 - `meeting.speakers.txt` и `meeting.speakers.json` (диаризация)
-- `meeting.speakers.summary.md` (саммари)
+- `meeting.speakers.summary.md` (режим `--summary-mode summary`, по умолчанию)
+- `meeting.speakers.lecture.md` (режим `--summary-mode lecture`)
+- `meeting.speakers.demo.md` (режим `--summary-mode demo`)
 
 ## 1. Установка
 
@@ -264,10 +266,14 @@ uv run python transcribe_whisperx.py meeting.webm \
   --video-participants-file ./participants.txt
 ```
 
-## 7. Саммари через LM Studio (OpenAI API)
+## 7. Саммари/Конспект/Демо-отчет через LM Studio (OpenAI API)
 
-После любого варианта транскрибации можно автоматически сделать summary через
-локальный OpenAI-compatible endpoint LM Studio.
+После любого варианта транскрибации можно автоматически сгенерировать:
+- `summary` — итоги встречи (по умолчанию);
+- `lecture` — подробный конспект лекции/воркшопа (включает отдельный блок с кратким конспектом).
+- `demo` — отчет по scrum-демо: показанные результаты разработки, статус целей и следующие шаги.
+
+Генерация идет через локальный OpenAI-compatible endpoint LM Studio.
 
 По умолчанию используется:
 - `--summary-base-url http://127.0.0.1:1234/v1`
@@ -277,7 +283,8 @@ uv run python transcribe_whisperx.py meeting.webm \
 - `--summary-retry-delay 2.0`
 - `--summary-chunk-chars 12000`
 - `--summary-chunk-overlap-chars 300`
-- встроенный промпт для структурированного саммари на русском
+- `--summary-mode summary` (по умолчанию), `--summary-mode lecture` или `--summary-mode demo`
+- встроенный mode-specific промпт (если не передан `--summary-prompt`)
 
 Если используете не LM Studio, а внешний OpenAI-compatible endpoint, задайте API ключ:
 
@@ -285,8 +292,8 @@ uv run python transcribe_whisperx.py meeting.webm \
 export OPENAI_API_KEY=sk-xxx
 ```
 
-Если стенограмма не влезает в один запрос, саммари автоматически делится на чанки,
-каждый чанк суммаризируется отдельно, затем частичные саммари объединяются в итоговое.
+Если стенограмма не влезает в один запрос, текст автоматически делится на чанки,
+каждый чанк обрабатывается отдельно, затем промежуточные результаты объединяются в итоговый.
 
 Пример с `transcribe_webm.py`:
 
@@ -294,6 +301,7 @@ export OPENAI_API_KEY=sk-xxx
 uv run python transcribe_webm.py meeting.webm \
   --backend auto \
   --summarize \
+  --summary-mode summary \
   --summary-model your-lmstudio-model \
   --summary-api-key "$OPENAI_API_KEY"
 ```
@@ -304,6 +312,29 @@ uv run python transcribe_webm.py meeting.webm \
 uv run python transcribe_whisperx.py meeting.webm \
   --device auto \
   --summarize \
+  --summary-mode summary \
+  --summary-model your-lmstudio-model \
+  --summary-api-key "$OPENAI_API_KEY"
+```
+
+Пример подробного конспекта лекции/воркшопа:
+
+```bash
+uv run python transcribe_whisperx.py lecture.webm \
+  --device auto \
+  --summarize \
+  --summary-mode lecture \
+  --summary-model your-lmstudio-model \
+  --summary-api-key "$OPENAI_API_KEY"
+```
+
+Пример отчета по scrum-демо:
+
+```bash
+uv run python transcribe_whisperx.py sprint_demo.webm \
+  --device auto \
+  --summarize \
+  --summary-mode demo \
   --summary-model your-lmstudio-model \
   --summary-api-key "$OPENAI_API_KEY"
 ```
@@ -323,6 +354,7 @@ uv run python transcribe_webm.py meeting.webm \
 
 ```bash
 uv run python summarize_transcript_json.py meeting.json \
+  --summary-mode summary \
   --summary-model qwen3-30b-a3b
 ```
 
@@ -332,11 +364,30 @@ uv run python summarize_transcript_json.py meeting.json \
 ```bash
 uv run python summarize_transcript_json.py meeting.speakers.json \
   --speaker-format always \
+  --summary-mode summary \
+  --summary-model qwen3-30b-a3b
+```
+
+Отдельный запуск конспекта лекции по JSON:
+
+```bash
+uv run python summarize_transcript_json.py lecture.speakers.json \
+  --speaker-format always \
+  --summary-mode lecture \
+  --summary-model qwen3-30b-a3b
+```
+
+Отдельный запуск отчета по demo-встрече из JSON:
+
+```bash
+uv run python summarize_transcript_json.py sprint_demo.speakers.json \
+  --speaker-format always \
+  --summary-mode demo \
   --summary-model qwen3-30b-a3b
 ```
 
 Параметр `--speaker-format`:
-- `auto` (по умолчанию): если в JSON есть speaker-сегменты, саммари строится по строкам вида `SPEAKER_XX: ...`, иначе по обычному тексту.
+- `auto` (по умолчанию): если в JSON есть speaker-сегменты, генерация строится по строкам вида `SPEAKER_XX: ...`, иначе по обычному тексту.
 - `always`: принудительно использовать speaker-формат; если speaker-сегментов нет, скрипт завершится с ошибкой.
 - `never`: всегда использовать plain text без speaker-меток.
 
